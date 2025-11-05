@@ -13,6 +13,7 @@ function extractMessageAndFormat(body: any) {
       message: body?.payload?.message,
       format: body?.payload?.format ?? "png",
       source: "node-envelope",
+      pushConfig: null,
     };
   }
 
@@ -55,7 +56,12 @@ function extractMessageAndFormat(body: any) {
       }
     }
 
-    return { message: text || undefined, format: "png", source: "jsonrpc" };
+    return {
+      message: text || undefined,
+      format: "png",
+      source: "jsonrpc",
+      pushConfig: body?.params?.configuration?.pushNotificationConfig || null
+    };
   }
 
   // (C) Bare { message, format }
@@ -64,23 +70,81 @@ function extractMessageAndFormat(body: any) {
       message: body.message,
       format: body?.format ?? "png",
       source: "bare",
+      pushConfig: null,
     };
   }
 
-  return { message: undefined, format: "png", source: "unknown" };
+  return { message: undefined, format: "png", source: "unknown", pushConfig: null };
+}
+
+async function sendTelexCallback(pushConfig: any, text: string) {
+  if (!pushConfig?.url || !pushConfig?.token) return;
+
+  await fetch(pushConfig.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // Telex told us to use Bearer
+      Authorization: `Bearer ${pushConfig.token}`
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "message/create",
+      params: {
+        message: {
+          kind: "message",
+          role: "assistant",
+          parts: [
+            {
+              kind: "text",
+              text
+            }
+          ]
+        }
+      }
+    })
+  });
 }
 
 export async function handleA2A(req: Request, res: Response) {
-  const { message, format, source } = extractMessageAndFormat(req.body);
+  const { message, format, source, pushConfig } = extractMessageAndFormat(req.body);
   console.log("[A2A] source:", source, "message:", message?.slice(0, 80));
 
   if (!message || !message.trim()) {
     return res.status(400).json({
       ok: false,
-      error: "no text found in JSON-RPC message",
+      error: "no text found in JSON-RPC message"
     });
   }
 
+  // 1) Call your existing landing handler, but intercept the JSON it would send
+  //    Simplest quick hack: call handleLanding-like logic in a helper.
+  //    For now, we'll reuse handleLanding by faking a mini Response object.
+
+  let resultBody: any = null;
+  const fakeRes = {
+    status: (_code: number) => fakeRes,
+    json: (body: any) => {
+      resultBody = body;
+      return fakeRes;
+    }
+  } as unknown as Response;
+
+  // Call your existing logic to generate the Orshot URL
   req.body = { message, format };
-  return handleLanding(req, res);
+  await handleLanding(req, fakeRes);
+
+  // If we got a valid result, push it back to Telex as plain text with the URL
+  if (resultBody?.ok && resultBody?.url && pushConfig) {
+    const text = `Here is your landing page mock:\n${resultBody.url}`;
+    await sendTelexCallback(pushConfig, text);
+  }
+
+  // 2) Return the original result for validators / debugging
+  if (resultBody) {
+    return res.json(resultBody);
+  }
+
+  // Fallback
+  return res.status(500).json({ ok: false, error: "failed to render landing page" });
 }
